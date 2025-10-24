@@ -7,7 +7,7 @@ Energy-Charts → verschiebbare Vektor-Flächen (Fabric.js via streamlit-drawabl
 - Zukunft/404/no data werden freundlich abgefangen
 - Kein Lösch-Schutz (vereinfachtes, stabiles Verhalten)
 - Reihenfolge steuerbar durch Entfernen & erneutes Hinzufügen (neue Einträge liegen oben)
-- Download des aktuellen Canvas-Zustands als SVG (korrekte Positionen/Abstände, Farben)
+- Download des aktuellen Canvas-Zustands als SVG (korrekte Positionen/Abstände)
 - Optionale feste Labels (nicht verschiebbar)
 
 Abhängigkeiten:
@@ -128,12 +128,15 @@ if do_load:
         st.warning("Keine kombinierten Erzeugerdaten verfügbar.")
         st.stop()
 
+    # Zustand setzen (kein rerun nötig)
     ss.df_combined = df_combined
     ss.loaded = True
+
+    # Ursprung zurücksetzen
     available_series = [c for c in df_combined.columns if c != "timestamp"]
-    ss.selection = [s for s in ss.order if s in available_series]
+    ss.selection = [s for s in ss.order if s in available_series]  # Standard-Auswahl
     ss.prev_selection = ss.selection.copy()
-    ss.canvas_json = None
+    ss.canvas_json = None  # frisches initial_drawing verwenden
 
 # Ohne Daten: freundlich beenden
 if not ss.loaded or ss.df_combined is None or ss.df_combined.empty:
@@ -141,7 +144,7 @@ if not ss.loaded or ss.df_combined is None or ss.df_combined.empty:
     st.stop()
 
 # ---------------------------
-# Auswahl der Energieträger
+# Auswahl der Energieträger (mit Reihenfolge-Hinweis)
 # ---------------------------
 available_series = [c for c in ss.df_combined.columns if c != "timestamp"]
 if not ss.selection:
@@ -150,13 +153,19 @@ if not ss.selection:
 st.write("**Energieträger auswählen (werden als verschiebbare Flächen erzeugt).**  "
          "_Reihenfolge steuerst du durch Entfernen & erneutes Hinzufügen (neue Einträge liegen oben)_")
 
-new_selection = st.multiselect(label="", options=available_series, default=ss.selection)
+new_selection = st.multiselect(
+    label="",
+    options=available_series,
+    default=ss.selection,
+)
 
+# Auswahl geändert → Layout verwerfen (neu aus Daten generieren)
 if set(new_selection) != set(ss.selection):
     ss.selection = new_selection
     ss.prev_selection = new_selection.copy()
     ss.canvas_json = None
 
+# Reihenfolge: bestehende behalten; neu ausgewählte kommen oben dazu
 current_order = [s for s in ss.order if s in ss.selection] + [s for s in ss.selection if s not in ss.order]
 ss.order = current_order + [s for s in ss.order if s not in ss.selection]
 stack_order = [s for s in ss.order if s in ss.selection]
@@ -166,25 +175,35 @@ if not stack_order:
     st.stop()
 
 # ---------------------------
-# Flächen generieren
+# Flächen (Polygonpfade) generieren – OBJ-LOKAL normalisiert
 # ---------------------------
 def _safe_numeric(s: pd.Series) -> np.ndarray:
     return pd.to_numeric(s, errors="coerce").fillna(0.0).to_numpy()
 
 def _build_normalized_path(name: str, top: np.ndarray, bottom: np.ndarray,
                            x_px: np.ndarray, y_scale: float, color: str) -> dict:
+    """Erzeugt ein Fabric-Path-Objekt mit PFADKOORDINATEN RELATIV zu (0,0),
+    und setzt left/top = (minX, minY). Dadurch stimmen Positionen/Abstände nach Verschieben & im SVG-Export."""
+    # Absolutpunkte (Canvas-Koordinaten)
     xs_upper = x_px
     ys_upper = CANVAS_HEIGHT - PADDING_BOTTOM - top * y_scale
     xs_lower = x_px[::-1]
     ys_lower = CANVAS_HEIGHT - PADDING_BOTTOM - bottom[::-1] * y_scale
+
+    # Alle Punkte für Bounding-Box
     all_x = np.concatenate([xs_upper, xs_lower])
     all_y = np.concatenate([ys_upper, ys_lower])
+
     min_x = float(np.min(all_x))
     min_y = float(np.min(all_y))
+
+    # In Objektkoordinaten verschieben (0,0) = (min_x, min_y)
     xu = xs_upper - min_x
     yu = ys_upper - min_y
     xl = xs_lower - min_x
     yl = ys_lower - min_y
+
+    # Pfadstring relativ zu (0,0)
     parts = [f"M {xu[0]:.1f} {yu[0]:.1f}"]
     for i in range(1, len(xu)):
         parts.append(f"L {xu[i]:.1f} {yu[i]:.1f}")
@@ -192,10 +211,11 @@ def _build_normalized_path(name: str, top: np.ndarray, bottom: np.ndarray,
         parts.append(f"L {xl[i]:.1f} {yl[i]:.1f}")
     parts.append("Z")
     path_str = " ".join(parts)
+
     return {
         "type": "path",
         "path": path_str,
-        "left": min_x,
+        "left": min_x,            # Position im Canvas
         "top": min_y,
         "fill": color,
         "stroke": "#333333",
@@ -213,6 +233,7 @@ dfc = ss.df_combined
 t = pd.to_datetime(dfc["timestamp"])
 n = len(t)
 x_px = np.linspace(PADDING_LEFT, CANVAS_WIDTH - PADDING_RIGHT, n)
+
 vals = np.column_stack([_safe_numeric(dfc[s]) for s in stack_order]) if stack_order else np.zeros((n, 0))
 cum_max = np.max(np.cumsum(vals, axis=1), axis=1) if vals.shape[1] > 0 else np.zeros(n)
 y_max = max(1.0, float(np.max(cum_max))) if cum_max.size > 0 else 1.0
@@ -229,12 +250,13 @@ for sname in stack_order:
     polygons.append(_build_normalized_path(sname, top, bottom, x_px, y_scale, color))
     offset = top
 
+# Optionale fixe Labels (nicht verschiebbar)
 label_objects = []
 if ss.labels_on:
     for obj in polygons:
         name = obj.get("name", "")
         lx = float(obj["left"]) + 10
-        ly = float(obj["top"]) + 16
+        ly = float(obj["top"]) + 16  # 16 ~ baseline für fontSize 14
         label_objects.append({
             "type": "textbox",
             "text": name,
@@ -251,6 +273,8 @@ if ss.labels_on:
         })
 
 initial_drawing = {"version": "5.2.4", "objects": polygons + label_objects}
+
+# initial_for_canvas:
 reuse_saved_layout = ss.canvas_json is not None and set(ss.selection) == set(ss.prev_selection)
 initial_for_canvas = ss.canvas_json if reuse_saved_layout else initial_drawing
 
@@ -265,20 +289,23 @@ canvas = st_canvas(
     background_color="#ffffff",
     height=CANVAS_HEIGHT,
     width=CANVAS_WIDTH,
-    drawing_mode="transform",
+    drawing_mode="transform",     # bewegen/skalieren/rotieren
     initial_drawing=initial_for_canvas,
     display_toolbar=True,
     key="canvas_poly_static_key",
 )
 
 # ---------------------------
-# SVG-Export
+# Serverseitiger SVG-Export aus Fabric-JSON
 # ---------------------------
 def _fabric_json_to_svg(j: dict | None, width: int, height: int) -> str | None:
+    """Konvertiert Fabric-JSON (st_canvas) in SVG mit korrekten Positionen/Abständen.
+       Erwartet path-Objekte mit objektlokalen Koordinaten und left/top/scale/angle."""
     if not j or "objects" not in j:
         return None
 
     def _path_to_d(path_val):
+        # kann String (unser Format) oder Array (Fabric-Format) sein
         if isinstance(path_val, str):
             return path_val
         if isinstance(path_val, list):
@@ -294,36 +321,6 @@ def _fabric_json_to_svg(j: dict | None, width: int, height: int) -> str | None:
             return " ".join(parts)
         return ""
 
-    def _normalize_fill_opacity(fill_val, obj_opacity):
-        svg_fill = fill_val or "none"
-        svg_opacity = 1.0 if obj_opacity is None else float(obj_opacity)
-        if isinstance(svg_fill, str):
-            s = svg_fill.strip()
-            if s.startswith("#") and len(s) == 9:
-                rgb = s[:7]
-                aa = s[7:]
-                try:
-                    a = int(aa, 16) / 255.0
-                except ValueError:
-                    a = 1.0
-                svg_fill = rgb
-                svg_opacity *= a
-            elif s.lower().startswith("rgba(") and s.endswith(")"):
-                try:
-                    inner = s[s.find("(")+1:-1]
-                    r, g, b, a = [x.strip() for x in inner.split(",")]
-                    r = max(0, min(255, int(float(r))))
-                    g = max(0, min(255, int(float(g))))
-                    b = max(0, min(255, int(float(b))))
-                    a = float(a)
-                    svg_fill = f"#{r:02x}{g:02x}{b:02x}"
-                    svg_opacity *= a
-                except Exception:
-                    pass
-            elif s.lower() == "transparent":
-                svg_fill = "none"
-        return svg_fill, svg_opacity
-
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
            f'viewBox="0 0 {width} {height}">']
 
@@ -333,11 +330,12 @@ def _fabric_json_to_svg(j: dict | None, width: int, height: int) -> str | None:
             d = _path_to_d(obj.get("path"))
             if not d:
                 continue
-            fill_raw = obj.get("fill", "none")
+            fill = obj.get("fill", "none")
             stroke = obj.get("stroke", "none")
             stroke_w = obj.get("strokeWidth", 1)
-            opacity_raw = obj.get("opacity", 1)
-            svg_fill, svg_opacity = _normalize_fill_opacity(fill_raw, opacity_raw)
+            opacity = obj.get("opacity", 1)
+
+            # Transform aus left/top/angle/scale – da Pfad nun objektlokal ist
             tx = float(obj.get("left", 0) or 0)
             ty = float(obj.get("top", 0) or 0)
             angle = float(obj.get("angle", 0) or 0)
@@ -351,26 +349,27 @@ def _fabric_json_to_svg(j: dict | None, width: int, height: int) -> str | None:
             if sx != 1 or sy != 1:
                 transforms.append(f"scale({sx:.6f},{sy:.6f})")
             t_attr = f' transform="{" ".join(transforms)}"' if transforms else ""
+
             svg.append(
-                f'<path d="{d}" fill="{svg_fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
-                f'opacity="{svg_opacity}"{t_attr}/>'
+                f'<path d="{d}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
+                f'opacity="{opacity}"{t_attr}/>'
             )
+
         elif otype in ("textbox", "text"):
             text = (obj.get("text") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             font_size = int(obj.get("fontSize", 14))
-            fill_raw = obj.get("fill", "#000000")
-            opacity_raw = obj.get("opacity", 1)
-            svg_fill, svg_opacity = _normalize_fill_opacity(fill_raw, opacity_raw)
+            fill = obj.get("fill", "#000000")
+            # Fabric top ist obere Kante; SVG y ist baseline → ~ +0.8*font_size
             x = float(obj.get("left", 0) or 0)
             y = float(obj.get("top", 0) or 0) + 0.8 * font_size
             svg.append(
-                f'<text x="{x:.1f}" y="{y:.1f}" font-size="{font_size}" fill="{svg_fill}" '
-                f'opacity="{svg_opacity}">{text}</text>'
+                f'<text x="{x:.1f}" y="{y:.1f}" font-size="{font_size}" fill="{fill}">{text}</text>'
             )
 
     svg.append("</svg>")
     return "".join(svg)
 
+# Download-Button für aktuelle Szene als SVG
 svg_str = _fabric_json_to_svg(canvas.json_data, CANVAS_WIDTH, CANVAS_HEIGHT)
 if svg_str:
     st.download_button(
@@ -381,6 +380,7 @@ if svg_str:
         use_container_width=True,
     )
 
+# Quellenangabe unter der Grafik (klein)
 st.markdown(
     "<div style='text-align:center; font-size:0.85em; color:gray;'>"
     "Quelle: <a href='https://energy-charts.info' target='_blank' "
