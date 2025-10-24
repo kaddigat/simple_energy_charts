@@ -82,10 +82,10 @@ if "canvas_json" not in ss:
     ss.canvas_json: dict | None = None
 if "prev_selection" not in ss:
     ss.prev_selection: list[str] = []
-if "labels_on" not in ss:
-    ss.labels_on = False  # Labels optional
 if "show_consumption" not in ss:
     ss.show_consumption = True  # Stromverbrauch standardmäßig sichtbar
+if "show_axes" not in ss:
+    ss.show_axes = False  # Achsen standardmäßig aus
 
 # ---------------------------
 # Sidebar: Start + Tage + Neu laden + Labels
@@ -94,7 +94,6 @@ with st.sidebar:
     st.header("⚙️ Einstellungen")
     ss.start = st.date_input("Startdatum (inkl.)", value=ss.start)
     ss.days = st.number_input("Anzahl Tage", min_value=1, max_value=7, value=int(ss.days), step=1)
-    ss.labels_on = st.checkbox("Labels anzeigen (fix, nicht verschiebbar)", value=ss.labels_on)
     do_load = st.button("🔁 Neu laden", type="primary", use_container_width=True)
 
 # ---------------------------
@@ -174,7 +173,11 @@ if set(selected_now) != set(ss.selection):
     ss.canvas_json = None
 
 # Anzeigeoption: Stromverbrauch (rote Linie)
-ss.show_consumption = st.toggle('Stromverbrauch anzeigen', value=ss.show_consumption)
+col_consumption, col_axes = st.columns(2)
+with col_consumption:
+    ss.show_consumption = st.toggle('Stromverbrauch anzeigen', value=ss.show_consumption)
+with col_axes:
+    ss.show_axes = st.toggle('Achsen anzeigen', value=ss.show_axes)
 
 # Reihenfolge: bestehende behalten; neu ausgewählte kommen oben dazu
 current_order = [s for s in ss.order if s in ss.selection] + [s for s in ss.selection if s not in ss.order]
@@ -347,29 +350,141 @@ try:
 except Exception:
     pass
 
-# Optionale fixe Labels (nicht verschiebbar)
-label_objects = []
-if ss.labels_on:
-    for obj in polygons:
-        name = obj.get("name", "")
-        lx = float(obj["left"]) + 10
-        ly = float(obj["top"]) + 16  # 16 ~ baseline für fontSize 14
-        label_objects.append({
-            "type": "textbox",
-            "text": name,
-            "left": lx,
-            "top": ly,
-            "fontSize": 14,
-            "fill": "#222222",
-            "selectable": False,
-            "evented": False,
-            "hasControls": False,
-            "lockMovementX": True,
-            "lockMovementY": True,
-            "name": f"label:{name}",
-        })
 
-initial_drawing = {"version": "5.2.4", "objects": polygons + consumption_objects + zero_line_objects + label_objects}
+
+# ---------- Achsen-Helfer (Fabric) ----------
+def _fabric_text(text, left, top, *, angle=0, font_size=14, fill="#333333", name="label", locked=True):
+    return {
+        "type": "textbox",
+        "text": str(text),
+        "left": float(left),
+        "top": float(top),
+        "angle": float(angle),
+        "fontSize": int(font_size),
+        "fill": fill,
+        "name": name,
+        "selectable": not locked,
+        "evented": not locked,
+        "lockMovementX": locked,
+        "lockMovementY": locked,
+        "hasBorders": False,
+        "hasControls": False,
+        "editable": False,
+        "fontFamily": "Inter, Roboto, Arial, sans-serif",
+    }
+
+def _fabric_line(x1, y1, x2, y2, *, stroke="#000000", width=1, name="axis", round_cap=True):
+    obj = {
+        "type": "line",
+        "x1": float(x1), "y1": float(y1),
+        "x2": float(x2), "y2": float(y2),
+        "stroke": stroke,
+        "strokeWidth": float(width),
+        "name": name,
+        "selectable": False,
+        "evented": False,
+    }
+    if round_cap:
+        obj["strokeLineCap"] = "round"
+    return obj
+
+WD_SHORT = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+def _weekday_short_from_ts(ts) -> str:
+    try:
+        return WD_SHORT[int(pd.to_datetime(ts).weekday())]
+    except Exception:
+        return ""
+
+def _day_boundary_indices(ts_series: "pd.Series") -> list[int]:
+    # indices where day changes (including 0)
+    idxs = [0]
+    if ts_series is None or len(ts_series) == 0:
+        return idxs
+    ts = pd.to_datetime(ts_series)
+    last = ts.iloc[0].date()
+    for i in range(1, len(ts)):
+        d = ts.iloc[i].date()
+        if d != last:
+            idxs.append(i)
+            last = d
+    return sorted(set(idxs))
+
+
+def build_axes_objects_minimal(timestamps: "pd.Series", x_px: "np.ndarray", y_max_value: float) -> list[dict]:
+    """
+    Minimaler Achsen-Satz:
+      - X: Tagesgrenzen (Ticks) + Wochentags-Labels an der Position 12:00 Uhr
+      - Y: vertikale Achse links; "0" an der Nullinie; Einheiten-Titel; GW-Markierung
+    """
+    if not getattr(ss, "show_axes", False):
+        return []
+    objs: list[dict] = []
+    # Basiskoordinaten
+    x_left = float(PADDING_LEFT)
+    y_bottom = float(CANVAS_HEIGHT - PADDING_BOTTOM)
+    y_top = float(PADDING_TOP)
+
+    # Y-Achse
+    objs.append(_fabric_line(x_left, y_top, x_left, y_bottom, stroke="#000000", width=1, name="axis-y", round_cap=True))
+
+    # X: Tagesgrenzen (Start jedes Tages) als Ticks (etwas längere Linie)
+    try:
+        ts = pd.to_datetime(timestamps)
+        n = len(x_px)
+        day_idxs = _day_boundary_indices(ts)
+        for di in day_idxs:
+            if n <= 0:
+                continue
+            xi = min(max(di, 0), n-1)
+            x = float(x_px[xi])
+            objs.append(_fabric_line(x, y_bottom, x, y_bottom + 8, stroke="#000000", width=1, name="tick-x-boundary", round_cap=True))
+
+        # Wochentags-Labels bei 12:00 je Tag
+        unique_days = sorted(set(ts.dt.date.tolist()))
+        for d in unique_days:
+            target = pd.Timestamp(year=d.year, month=d.month, day=d.day, hour=12, minute=0, second=0)
+            idx = int((ts - target).abs().argmin())
+            xi = min(max(idx, 0), n-1)
+            x_mid = float(x_px[xi])
+            wd = _weekday_short_from_ts(ts.iloc[xi])
+            if wd:
+                objs.append(_fabric_text(wd, x_mid - 10, y_bottom + 14, font_size=14, fill="#333333", name=f"ticklabel-x-mid-{wd}", locked=True))
+    except Exception:
+        pass
+
+    # Y-"0" an Nullinie
+    try:
+        objs.append(_fabric_text("0", x_left - 12, y_bottom - 6, font_size=14, fill="#333333", name="ylabel-0", locked=True))
+    except Exception:
+        pass
+
+    # Y: Einheiten-Titel (gedreht, mittig)
+    try:
+        y_mid = (y_top + y_bottom) / 2.0
+        objs.append(_fabric_text("Elektrische Leistung", x_left - 54, y_mid, angle=-90, font_size=14, fill="#333333", name="ylabel-title", locked=True))
+    except Exception:
+        pass
+
+    # Y: GW-Markierung (abgerundete Maximalleistung)
+    try:
+        y_max_val = float(y_max_value)
+        gw_floor = int(y_max_val // 1000)  # volle GW
+        if gw_floor >= 1:
+            y_val = gw_floor * 1000.0
+            usable_h = (CANVAS_HEIGHT - PADDING_TOP - PADDING_BOTTOM)
+            y_pos = float(CANVAS_HEIGHT - PADDING_BOTTOM - (y_val * (usable_h / max(y_max_val, 1e-9))))
+            # Tick an der Achse
+            objs.append(_fabric_line(x_left - 6, y_pos, x_left, y_pos, stroke="#000000", width=1, name="tick-y-gw", round_cap=True))
+            # Label "x GW"
+            objs.append(_fabric_text(f"{gw_floor} GW", x_left - 44, y_pos - 6, font_size=14, fill="#333333", name="ylabel-gw", locked=True))
+    except Exception:
+        pass
+
+    return objs
+
+axes_objects = build_axes_objects_minimal(timestamps=t, x_px=x_px, y_max_value=y_max)
+initial_drawing = {"version": "5.2.4", "objects": polygons + consumption_objects + zero_line_objects + axes_objects}
 
 # initial_for_canvas:
 reuse_saved_layout = ss.canvas_json is not None and set(ss.selection) == set(ss.prev_selection)
