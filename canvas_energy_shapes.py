@@ -133,6 +133,7 @@ if do_load:
     ss.loaded = True
 
     # Ursprung zurücksetzen
+    ss.order = DEFAULT_ORDER.copy()  # <— Reset auf Default-Reihenfolge bei 'Neu laden'
     available_series = [c for c in df_combined.columns if c != "timestamp"]
     ss.selection = [s for s in ss.order if s in available_series]  # Standard-Auswahl
     ss.prev_selection = ss.selection.copy()
