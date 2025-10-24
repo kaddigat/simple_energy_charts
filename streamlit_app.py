@@ -1,50 +1,53 @@
-# canvas_energy_shapes.py
+# streamlit_app.py
 # -*- coding: utf-8 -*-
 """
-Energy-Charts → verschiebbare Vektor-Flächen (Fabric.js via streamlit-drawable-canvas)
-- Startdatum + Anzahl Tage (1–7), Enddatum intern
-- Ein Button: 'Neu laden' (lädt & setzt Ursprung zurück)
-- Zukunft/404/no data werden freundlich abgefangen
-- Kein Lösch-Schutz (vereinfachtes, stabiles Verhalten)
-- Reihenfolge steuerbar durch Entfernen & erneutes Hinzufügen (neue Einträge liegen oben)
-- Download des aktuellen Canvas-Zustands als SVG (korrekte Positionen/Abstände, Farben)
-- Optionale feste Labels (nicht verschiebbar)
-
-Abhängigkeiten:
-    pip install streamlit streamlit-drawable-canvas pandas numpy
+Interaktive Streamlit-Oberfläche (ersetzt die klassische Plot-Routine).
+- Freie Datumswahl
+- Feste Farben und deutsche Labels
+- Aggregiert: nur "Stromverbrauch" (kein "Residual load")
+- Rechte Achse exakt gleiche Skala wie linke (matches="y")
+- Definierte Stack-Reihenfolge (unten → oben)
+- Freundliche Meldung bei leeren/ zukünftigen Zeiträumen
+- Quellenangabe unter dem Plot
+- Button exakt auf Höhe der Datumsfelder (ohne fragile CSS-Hacks)
 """
 from __future__ import annotations
-
-import datetime as dt
 import streamlit as st
+import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-from streamlit_drawable_canvas import st_canvas
+import datetime as dt
 
-from ec_fetch import fetch_public_power
+from ec_fetch import fetch_public_power, last_full_week
 from ec_transform import transform_df
 
-# Optional: spezifische Fehlerklasse aus Submodul (falls vorhanden)
-try:
-    from app.api import APIRequestError  # type: ignore
-except Exception:
-    class APIRequestError(Exception):
-        pass
+# ---- Seitentitel wie zuvor ----
+st.set_page_config(page_title="Strommix in 🇩🇪: Energy-Charts", layout="wide")
+st.title("🔌 Strommix in 🇩🇪: Energy-Charts")
 
-st.set_page_config(page_title="🎨 Strommix in 🇩🇪", layout="wide")
-st.title("🎨 Strommix in 🇩🇪")
-
-# Farben (unten → oben gedacht)
+# ---- Feste Farben (Hex) ----
 COLOR = {
-    "Biomasse": "#2ca02cCC",
-    "Photovoltaik": "#ffd700CC",
-    "Wasserkraft": "#003366CC",
-    "Wind": "#87ceebCC",
-    "Kohle und Öl": "#8b4513CC",
-    "Gas": "#d2b48cCC",
-    "Andere": "#7f7f7fCC",
+    # Aggregiert
+    "Stromverbrauch": "#d62728",            # rot
+
+    # Erzeuger (kombiniert)
+    "Biomasse": "#2ca02c",                  # grün
+    "Photovoltaik": "#ffd700",              # gelb
+    "Wasserkraft": "#003366",               # dunkelblau
+    "Wind": "#87ceeb",                      # hellblau
+    "Kohle und Öl": "#8b4513",              # dunkelbraun
+    "Gas": "#d2b48c",                       # hellbraun
+    "Andere": "#7f7f7f",                    # grau
+
+    # Ausgleich (deutsche Labels)
+    "Pumpspeicher (Stromerzeugung)": "#555555",
+    "Pumpspeicher (Stromverbrauch)": "#999999",
+    "Grenzüberschreitender Stromhandel": "#444444",
 }
-DEFAULT_ORDER = [
+
+# ---- Gewünschte Stack-Reihenfolge: unten → oben ----
+STACK_ORDER = [
+    "Pumpspeicher (Stromverbrauch)",
+    "Grenzüberschreitender Stromhandel",
     "Andere",
     "Wasserkraft",
     "Biomasse",
@@ -52,339 +55,125 @@ DEFAULT_ORDER = [
     "Photovoltaik",
     "Kohle und Öl",
     "Gas",
+    "Pumpspeicher (Stromerzeugung)",
 ]
 
-# Canvas-Geometrie
-CANVAS_WIDTH = 1200
-CANVAS_HEIGHT = 600
-PADDING_TOP = 20
-PADDING_BOTTOM = 40
-PADDING_LEFT = 40
-PADDING_RIGHT = 20
+def _safe_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0.0)
 
-# ---------------------------
-# Session-State
-# ---------------------------
-ss = st.session_state
-if "loaded" not in ss:
-    ss.loaded = False
-if "df_combined" not in ss:
-    ss.df_combined: pd.DataFrame | None = None
-if "start" not in ss:
-    ss.start = dt.date.today() - dt.timedelta(days=7)
-if "days" not in ss:
-    ss.days = 7
-if "selection" not in ss:
-    ss.selection: list[str] = []
-if "order" not in ss:
-    ss.order = DEFAULT_ORDER.copy()
-if "canvas_json" not in ss:
-    ss.canvas_json: dict | None = None
-if "prev_selection" not in ss:
-    ss.prev_selection: list[str] = []
-if "labels_on" not in ss:
-    ss.labels_on = False  # Labels optional
+def _try_get_column(df: pd.DataFrame, col: str) -> pd.Series | None:
+    if col in df.columns:
+        return _safe_numeric(df[col])
+    return None
 
-# ---------------------------
-# Sidebar: Start + Tage + Neu laden + Labels
-# ---------------------------
-with st.sidebar:
-    st.header("⚙️ Einstellungen")
-    ss.start = st.date_input("Startdatum (inkl.)", value=ss.start)
-    ss.days = st.number_input("Anzahl Tage", min_value=1, max_value=7, value=int(ss.days), step=1)
-    ss.labels_on = st.checkbox("Labels anzeigen (fix, nicht verschiebbar)", value=ss.labels_on)
-    do_load = st.button("🔁 Neu laden", type="primary", use_container_width=True)
+def _build_stacked_traces_by_order(t: pd.Series, df_combined: pd.DataFrame, df_bal: pd.DataFrame) -> list[go.Scatter]:
+    """Baut gestapelte Flächen-Traces in fester Reihenfolge (unten→oben)."""
+    traces: list[go.Scatter] = []
+    for name in STACK_ORDER:
+        s = _try_get_column(df_bal, name)
+        if s is None:
+            s = _try_get_column(df_combined, name)
+        if s is None:
+            continue
+        color = COLOR.get(name)
+        traces.append(
+            go.Scatter(
+                x=t, y=s, name=name,
+                mode="lines",
+                stackgroup="power",
+                line=dict(width=0.8, color=color) if color else dict(width=0.8),
+                fillcolor=color if color else None,
+            )
+        )
+    return traces
 
-# ---------------------------
-# Daten laden (und Ursprung zurücksetzen)
-# ---------------------------
-if do_load:
-    end = ss.start + dt.timedelta(days=int(ss.days))
-    if end <= ss.start:
+def _line_traces_from_df(df: pd.DataFrame, yaxis="y2", exclude=("timestamp",)):
+    """Erzeugt Linien-Traces (Plotly) für rechte Achse ('Stromverbrauch')."""
+    traces = []
+    t = pd.to_datetime(df["timestamp"])
+    for c in [c for c in df.columns if c not in exclude]:
+        y = pd.to_numeric(df[c], errors="coerce")
+        color = COLOR.get(c)
+        traces.append(
+            go.Scatter(
+                x=t, y=y, name=c, mode="lines", yaxis=yaxis,
+                line=dict(width=2, color=color) if color else dict(width=2)
+            )
+        )
+    return traces
+
+# ---- Zeitraum-UI: Button exakt auf Höhe der Inputs ----
+default_s, default_e = last_full_week()
+col1, col2, col3 = st.columns([1, 1, 0.7])
+
+with col1:
+    st.markdown("**Start (inkl.)**")  # eigenes Label, damit der Input höher sitzt
+    start = st.date_input(label="", value=default_s, label_visibility="collapsed")
+
+with col2:
+    st.markdown("**Ende (exkl.)**")
+    end = st.date_input(label="", value=default_e, label_visibility="collapsed")
+
+with col3:
+    # Spacer ersetzt Label-Höhe -> Button beginnt auf gleicher vertikaler Linie wie die Inputs
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    go_btn = st.button("📊 Plot aktualisieren", use_container_width=True)
+
+# ---- Hauptlogik ----
+if go_btn:
+    if end <= start:
         st.error("Ende muss nach Start liegen (exklusiv).")
         st.stop()
 
     try:
-        with st.spinner("Lade Energy-Charts-Daten..."):
-            df_raw = fetch_public_power(ss.start, end)
-    except APIRequestError:
-        st.warning("Für den gewählten Zeitraum sind keine Daten verfügbar.")
-        st.stop()
+        with st.spinner("Lade Daten..."):
+            df_raw = fetch_public_power(start, end)
+
+        if df_raw is None or df_raw.empty:
+            st.warning("Für den gewählten Zeitraum sind keine Daten verfügbar.")
+            st.stop()
+
+        _, df_combined, df_bal, df_agg = transform_df(df_raw)
+
+        if df_combined.empty and df_bal.empty and df_agg.empty:
+            st.warning("Für den gewählten Zeitraum sind keine Daten verfügbar.")
+            st.stop()
+
     except Exception:
         st.warning("Für den gewählten Zeitraum sind keine Daten verfügbar.")
         st.stop()
 
-    if df_raw is None or df_raw.empty:
-        st.warning("Für den gewählten Zeitraum sind keine Daten verfügbar.")
-        st.stop()
+    # ---- Plot ----
+    t = pd.to_datetime(df_combined["timestamp"] if "timestamp" in df_combined else df_bal["timestamp"])
+    traces = []
+    traces += _build_stacked_traces_by_order(t, df_combined, df_bal)
+    traces += _line_traces_from_df(df_agg, yaxis="y2")
 
-    try:
-        _, df_combined, _, _ = transform_df(df_raw)
-    except Exception:
-        st.warning("Daten konnten nicht aufbereitet werden.")
-        st.stop()
-
-    if df_combined.empty:
-        st.warning("Keine kombinierten Erzeugerdaten verfügbar.")
-        st.stop()
-
-    ss.df_combined = df_combined
-    ss.loaded = True
-    available_series = [c for c in df_combined.columns if c != "timestamp"]
-    ss.selection = [s for s in ss.order if s in available_series]
-    ss.prev_selection = ss.selection.copy()
-    ss.canvas_json = None
-
-# Ohne Daten: freundlich beenden
-if not ss.loaded or ss.df_combined is None or ss.df_combined.empty:
-    st.info("Bitte Startdatum und Anzahl Tage wählen und **Neu laden**.")
-    st.stop()
-
-# ---------------------------
-# Auswahl der Energieträger
-# ---------------------------
-available_series = [c for c in ss.df_combined.columns if c != "timestamp"]
-if not ss.selection:
-    ss.selection = [s for s in ss.order if s in available_series]
-
-st.write("**Energieträger auswählen (werden als verschiebbare Flächen erzeugt).**  "
-         "_Reihenfolge steuerst du durch Entfernen & erneutes Hinzufügen (neue Einträge liegen oben)_")
-
-new_selection = st.multiselect(label="", options=available_series, default=ss.selection)
-
-if set(new_selection) != set(ss.selection):
-    ss.selection = new_selection
-    ss.prev_selection = new_selection.copy()
-    ss.canvas_json = None
-
-current_order = [s for s in ss.order if s in ss.selection] + [s for s in ss.selection if s not in ss.order]
-ss.order = current_order + [s for s in ss.order if s not in ss.selection]
-stack_order = [s for s in ss.order if s in ss.selection]
-
-if not stack_order:
-    st.info("Bitte mindestens einen Energieträger auswählen.")
-    st.stop()
-
-# ---------------------------
-# Flächen generieren
-# ---------------------------
-def _safe_numeric(s: pd.Series) -> np.ndarray:
-    return pd.to_numeric(s, errors="coerce").fillna(0.0).to_numpy()
-
-def _build_normalized_path(name: str, top: np.ndarray, bottom: np.ndarray,
-                           x_px: np.ndarray, y_scale: float, color: str) -> dict:
-    xs_upper = x_px
-    ys_upper = CANVAS_HEIGHT - PADDING_BOTTOM - top * y_scale
-    xs_lower = x_px[::-1]
-    ys_lower = CANVAS_HEIGHT - PADDING_BOTTOM - bottom[::-1] * y_scale
-    all_x = np.concatenate([xs_upper, xs_lower])
-    all_y = np.concatenate([ys_upper, ys_lower])
-    min_x = float(np.min(all_x))
-    min_y = float(np.min(all_y))
-    xu = xs_upper - min_x
-    yu = ys_upper - min_y
-    xl = xs_lower - min_x
-    yl = ys_lower - min_y
-    parts = [f"M {xu[0]:.1f} {yu[0]:.1f}"]
-    for i in range(1, len(xu)):
-        parts.append(f"L {xu[i]:.1f} {yu[i]:.1f}")
-    for i in range(len(xl)):
-        parts.append(f"L {xl[i]:.1f} {yl[i]:.1f}")
-    parts.append("Z")
-    path_str = " ".join(parts)
-    return {
-        "type": "path",
-        "path": path_str,
-        "left": min_x,
-        "top": min_y,
-        "fill": color,
-        "stroke": "#333333",
-        "strokeWidth": 1,
-        "opacity": 0.9,
-        "selectable": True,
-        "hoverCursor": "move",
-        "name": name,
-        "scaleX": 1.0,
-        "scaleY": 1.0,
-        "angle": 0,
-    }
-
-dfc = ss.df_combined
-t = pd.to_datetime(dfc["timestamp"])
-n = len(t)
-x_px = np.linspace(PADDING_LEFT, CANVAS_WIDTH - PADDING_RIGHT, n)
-vals = np.column_stack([_safe_numeric(dfc[s]) for s in stack_order]) if stack_order else np.zeros((n, 0))
-cum_max = np.max(np.cumsum(vals, axis=1), axis=1) if vals.shape[1] > 0 else np.zeros(n)
-y_max = max(1.0, float(np.max(cum_max))) if cum_max.size > 0 else 1.0
-usable_height = CANVAS_HEIGHT - PADDING_TOP - PADDING_BOTTOM
-y_scale = usable_height / y_max
-
-polygons = []
-offset = np.zeros(n)
-for sname in stack_order:
-    series = _safe_numeric(dfc[sname])
-    top = offset + series
-    bottom = offset
-    color = COLOR.get(sname, "#999999CC")
-    polygons.append(_build_normalized_path(sname, top, bottom, x_px, y_scale, color))
-    offset = top
-
-label_objects = []
-if ss.labels_on:
-    for obj in polygons:
-        name = obj.get("name", "")
-        lx = float(obj["left"]) + 10
-        ly = float(obj["top"]) + 16
-        label_objects.append({
-            "type": "textbox",
-            "text": name,
-            "left": lx,
-            "top": ly,
-            "fontSize": 14,
-            "fill": "#222222",
-            "selectable": False,
-            "evented": False,
-            "hasControls": False,
-            "lockMovementX": True,
-            "lockMovementY": True,
-            "name": f"label:{name}",
-        })
-
-initial_drawing = {"version": "5.2.4", "objects": polygons + label_objects}
-reuse_saved_layout = ss.canvas_json is not None and set(ss.selection) == set(ss.prev_selection)
-initial_for_canvas = ss.canvas_json if reuse_saved_layout else initial_drawing
-
-# ---------------------------
-# Canvas anzeigen
-# ---------------------------
-st.subheader("🖼️ Verschiebbare Flächen")
-canvas = st_canvas(
-    fill_color="rgba(0,0,0,0)",
-    stroke_width=1,
-    stroke_color="#000000",
-    background_color="#ffffff",
-    height=CANVAS_HEIGHT,
-    width=CANVAS_WIDTH,
-    drawing_mode="transform",
-    initial_drawing=initial_for_canvas,
-    display_toolbar=True,
-    key="canvas_poly_static_key",
-)
-
-# ---------------------------
-# SVG-Export
-# ---------------------------
-def _fabric_json_to_svg(j: dict | None, width: int, height: int) -> str | None:
-    if not j or "objects" not in j:
-        return None
-
-    def _path_to_d(path_val):
-        if isinstance(path_val, str):
-            return path_val
-        if isinstance(path_val, list):
-            parts = []
-            for seg in path_val:
-                if isinstance(seg, list) and seg:
-                    cmd = seg[0]
-                    nums = seg[1:]
-                    nums_fmt = " ".join(f"{float(v):.3f}" if isinstance(v, (int, float)) else str(v) for v in nums)
-                    parts.append(f"{cmd} {nums_fmt}".strip())
-                elif isinstance(seg, str):
-                    parts.append(seg)
-            return " ".join(parts)
-        return ""
-
-    def _normalize_fill_opacity(fill_val, obj_opacity):
-        svg_fill = fill_val or "none"
-        svg_opacity = 1.0 if obj_opacity is None else float(obj_opacity)
-        if isinstance(svg_fill, str):
-            s = svg_fill.strip()
-            if s.startswith("#") and len(s) == 9:
-                rgb = s[:7]
-                aa = s[7:]
-                try:
-                    a = int(aa, 16) / 255.0
-                except ValueError:
-                    a = 1.0
-                svg_fill = rgb
-                svg_opacity *= a
-            elif s.lower().startswith("rgba(") and s.endswith(")"):
-                try:
-                    inner = s[s.find("(")+1:-1]
-                    r, g, b, a = [x.strip() for x in inner.split(",")]
-                    r = max(0, min(255, int(float(r))))
-                    g = max(0, min(255, int(float(g))))
-                    b = max(0, min(255, int(float(b))))
-                    a = float(a)
-                    svg_fill = f"#{r:02x}{g:02x}{b:02x}"
-                    svg_opacity *= a
-                except Exception:
-                    pass
-            elif s.lower() == "transparent":
-                svg_fill = "none"
-        return svg_fill, svg_opacity
-
-    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-           f'viewBox="0 0 {width} {height}">']
-
-    for obj in j["objects"]:
-        otype = obj.get("type")
-        if otype == "path":
-            d = _path_to_d(obj.get("path"))
-            if not d:
-                continue
-            fill_raw = obj.get("fill", "none")
-            stroke = obj.get("stroke", "none")
-            stroke_w = obj.get("strokeWidth", 1)
-            opacity_raw = obj.get("opacity", 1)
-            svg_fill, svg_opacity = _normalize_fill_opacity(fill_raw, opacity_raw)
-            tx = float(obj.get("left", 0) or 0)
-            ty = float(obj.get("top", 0) or 0)
-            angle = float(obj.get("angle", 0) or 0)
-            sx = float(obj.get("scaleX", 1) or 1)
-            sy = float(obj.get("scaleY", 1) or 1)
-            transforms = []
-            if tx or ty:
-                transforms.append(f"translate({tx:.3f},{ty:.3f})")
-            if angle:
-                transforms.append(f"rotate({angle:.3f})")
-            if sx != 1 or sy != 1:
-                transforms.append(f"scale({sx:.6f},{sy:.6f})")
-            t_attr = f' transform="{" ".join(transforms)}"' if transforms else ""
-            svg.append(
-                f'<path d="{d}" fill="{svg_fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
-                f'opacity="{svg_opacity}"{t_attr}/>'
-            )
-        elif otype in ("textbox", "text"):
-            text = (obj.get("text") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            font_size = int(obj.get("fontSize", 14))
-            fill_raw = obj.get("fill", "#000000")
-            opacity_raw = obj.get("opacity", 1)
-            svg_fill, svg_opacity = _normalize_fill_opacity(fill_raw, opacity_raw)
-            x = float(obj.get("left", 0) or 0)
-            y = float(obj.get("top", 0) or 0) + 0.8 * font_size
-            svg.append(
-                f'<text x="{x:.1f}" y="{y:.1f}" font-size="{font_size}" fill="{svg_fill}" '
-                f'opacity="{svg_opacity}">{text}</text>'
-            )
-
-    svg.append("</svg>")
-    return "".join(svg)
-
-svg_str = _fabric_json_to_svg(canvas.json_data, CANVAS_WIDTH, CANVAS_HEIGHT)
-if svg_str:
-    st.download_button(
-        label="⬇️ Aktuelle Grafik als SVG herunterladen",
-        data=svg_str.encode("utf-8"),
-        file_name="energy_canvas.svg",
-        mime="image/svg+xml",
-        use_container_width=True,
+    layout = go.Layout(
+        xaxis=dict(type="date"),
+        yaxis=dict(title="Leistung [MW]"),
+        yaxis2=dict(
+            title="Stromverbrauch",
+            overlaying="y",
+            side="right",
+            matches="y"       # identische Skala/Nullpunkt wie linke Achse
+        ),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=-0.2),
+        title=f"{start:%d.%m.%Y} bis {(end - dt.timedelta(days=1)):%d.%m.%Y}",
+        margin=dict(l=60, r=60, t=40, b=40)
     )
 
-st.markdown(
-    "<div style='text-align:center; font-size:0.85em; color:gray;'>"
-    "Quelle: <a href='https://energy-charts.info' target='_blank' "
-    "style='color:gray; text-decoration:none;'>energy-charts.info (Fraunhofer ISE)</a>"
-    "</div>",
-    unsafe_allow_html=True
-)
+    fig = go.Figure(data=traces, layout=layout)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Quellenangabe ----
+    st.markdown(
+        "<div style='text-align:center; font-size:0.8em; color:gray;'>"
+        "Quelle: <a href='https://energy-charts.info' target='_blank' "
+        "style='color:gray; text-decoration:none;'>energy-charts.info (Fraunhofer ISE)</a>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+else:
+    st.info("Bitte Zeitraum wählen und **Plot aktualisieren** klicken.")
