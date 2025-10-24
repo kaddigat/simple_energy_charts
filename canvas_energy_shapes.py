@@ -31,8 +31,8 @@ except Exception:
     class APIRequestError(Exception):
         pass
 
-st.set_page_config(page_title="🎨 Strommix in 🇩🇪", layout="wide")
-st.title("🎨 Strommix in 🇩🇪")
+st.set_page_config(page_title="Strommix in 🇩🇪: Gestalte deine Postkarte 🎨", layout="wide")
+st.title("Strommix in 🇩🇪: Gestalte deine Postkarte 🎨")
 
 # Farben (unten → oben gedacht)
 COLOR = {
@@ -84,6 +84,8 @@ if "prev_selection" not in ss:
     ss.prev_selection: list[str] = []
 if "labels_on" not in ss:
     ss.labels_on = False  # Labels optional
+if "show_consumption" not in ss:
+    ss.show_consumption = True  # Stromverbrauch standardmäßig sichtbar
 
 # ---------------------------
 # Sidebar: Start + Tage + Neu laden + Labels
@@ -119,7 +121,7 @@ if do_load:
         st.stop()
 
     try:
-        _, df_combined, _, _ = transform_df(df_raw)
+        _, df_combined, _, df_aggregated = transform_df(df_raw)
     except Exception:
         st.warning("Daten konnten nicht aufbereitet werden.")
         st.stop()
@@ -130,6 +132,7 @@ if do_load:
 
     # Zustand setzen (kein rerun nötig)
     ss.df_combined = df_combined
+    ss.df_aggregated = df_aggregated
     ss.loaded = True
 
     # Ursprung zurücksetzen
@@ -138,6 +141,9 @@ if do_load:
     ss.selection = [s for s in ss.order if s in available_series]  # Standard-Auswahl
     ss.prev_selection = ss.selection.copy()
     ss.canvas_json = None  # frisches initial_drawing verwenden
+    # Multiselect-Widget und Verbrauchs-Toggle auf Defaults setzen
+    st.session_state['selection_widget'] = ss.selection
+    ss.show_consumption = True
 
 # Ohne Daten: freundlich beenden
 if not ss.loaded or ss.df_combined is None or ss.df_combined.empty:
@@ -148,9 +154,8 @@ if not ss.loaded or ss.df_combined is None or ss.df_combined.empty:
 # Auswahl der Energieträger (mit Reihenfolge-Hinweis)
 # ---------------------------
 available_series = [c for c in ss.df_combined.columns if c != "timestamp"]
-if not ss.selection:
-    ss.selection = [s for s in ss.order if s in available_series]
-
+# Hinweis: Nach dem ersten Laden NICHT automatisch auffüllen.
+# Der Benutzer kann bewusst alle entfernen und später einzelne wieder hinzufügen.
 st.write("**Energieträger auswählen (werden als verschiebbare Flächen erzeugt).**  "
          "_Reihenfolge steuerst du durch Entfernen & erneutes Hinzufügen (neue Einträge liegen oben)_")
 
@@ -158,22 +163,31 @@ new_selection = st.multiselect(
     label="",
     options=available_series,
     default=ss.selection,
+    key='selection_widget'
 )
 
 # Auswahl geändert → Layout verwerfen (neu aus Daten generieren)
-if set(new_selection) != set(ss.selection):
-    ss.selection = new_selection
-    ss.prev_selection = new_selection.copy()
+selected_now = st.session_state.get('selection_widget', new_selection)
+if set(selected_now) != set(ss.selection):
+    ss.selection = list(selected_now)
+    ss.prev_selection = list(selected_now)
     ss.canvas_json = None
+
+# Anzeigeoption: Stromverbrauch (rote Linie)
+ss.show_consumption = st.toggle('Stromverbrauch anzeigen', value=ss.show_consumption)
 
 # Reihenfolge: bestehende behalten; neu ausgewählte kommen oben dazu
 current_order = [s for s in ss.order if s in ss.selection] + [s for s in ss.selection if s not in ss.order]
 ss.order = current_order + [s for s in ss.order if s not in ss.selection]
 stack_order = [s for s in ss.order if s in ss.selection]
+# Fallback: falls Reihenfolge-Intersection leer (z. B. nach komplettem Entfernen),
+# verwende die aktuelle Auswahl direkt als Stack-Reihenfolge.
+if not stack_order and ss.selection:
+    stack_order = ss.selection.copy()
 
 if not stack_order:
-    st.info("Bitte mindestens einen Energieträger auswählen.")
-    st.stop()
+    if not (ss.show_consumption and hasattr(ss, 'df_aggregated') and ss.df_aggregated is not None and 'Stromverbrauch' in ss.df_aggregated.columns):
+        st.info("Bitte mindestens einen Energieträger auswählen oder den Stromverbrauch anzeigen.")
 
 # ---------------------------
 # Flächen (Polygonpfade) generieren – OBJ-LOKAL normalisiert
@@ -238,8 +252,16 @@ x_px = np.linspace(PADDING_LEFT, CANVAS_WIDTH - PADDING_RIGHT, n)
 vals = np.column_stack([_safe_numeric(dfc[s]) for s in stack_order]) if stack_order else np.zeros((n, 0))
 cum_max = np.max(np.cumsum(vals, axis=1), axis=1) if vals.shape[1] > 0 else np.zeros(n)
 y_max = max(1.0, float(np.max(cum_max))) if cum_max.size > 0 else 1.0
+# Wenn Stromverbrauch angezeigt wird, in die Skalierung einbeziehen
+try:
+    if ss.show_consumption and hasattr(ss, 'df_aggregated') and ss.df_aggregated is not None and 'Stromverbrauch' in ss.df_aggregated.columns:
+        cons_arr = pd.to_numeric(ss.df_aggregated['Stromverbrauch'], errors='coerce').fillna(0.0).to_numpy()
+        if cons_arr.size > 0:
+            y_max = max(y_max, float(np.nanmax(cons_arr)))
+except Exception:
+    pass
 usable_height = CANVAS_HEIGHT - PADDING_TOP - PADDING_BOTTOM
-y_scale = usable_height / y_max
+y_scale = usable_height / max(y_max, 1e-9)
 
 polygons = []
 offset = np.zeros(n)
@@ -250,6 +272,80 @@ for sname in stack_order:
     color = COLOR.get(sname, "#999999CC")
     polygons.append(_build_normalized_path(sname, top, bottom, x_px, y_scale, color))
     offset = top
+
+# Stromverbrauch als rote Linie (nicht verschiebbar)
+consumption_objects = []
+try:
+    dfagg = ss.df_aggregated if hasattr(ss, 'df_aggregated') else None
+    if ss.show_consumption and dfagg is not None and 'Stromverbrauch' in dfagg.columns:
+        cons = pd.to_numeric(dfagg['Stromverbrauch'], errors='coerce').fillna(0.0).to_numpy()
+        # Länge an x_px angleichen
+        m = int(min(len(cons), len(x_px)))
+        cons = cons[:m]
+        x_line = x_px[:m]
+        y_line = CANVAS_HEIGHT - PADDING_BOTTOM - cons * y_scale
+        # Relative Pfadkoordinaten wie bei den Flächenobjekten
+        min_x = float(x_line.min())
+        min_y = float(y_line.min())
+        parts = [f"M {float(x_line[0]-min_x):.1f} {float(y_line[0]-min_y):.1f}"]
+        for i in range(1, m):
+            parts.append(f"L {float(x_line[i]-min_x):.1f} {float(y_line[i]-min_y):.1f}")
+        path_str = ' '.join(parts)
+        consumption_objects.append({
+            'type': 'path',
+            'path': path_str,
+            'left': min_x,
+            'top': min_y,
+            'fill': '',
+            'stroke': '#ff0000',
+            'strokeWidth': 4,
+            'strokeUniform': True,
+            'selectable': False,
+            'evented': False,
+            'hasControls': False,
+            'hasBorders': False,
+            'lockMovementX': True,
+            'lockMovementY': True,
+            'lockScalingX': True,
+            'lockScalingY': True,
+            'lockRotation': True,
+            'hoverCursor': 'default',
+            'name': 'Stromverbrauch',
+        })
+except Exception:
+    pass
+# Nullinie (immer sichtbar, sehr dünne schwarze Linie, nicht verschiebbar)
+zero_line_objects = []
+try:
+    # Nutze x_px für Länge, baseline bei y=0
+    if len(x_px) >= 2:
+        min_x = float(x_px[0])
+        max_x = float(x_px[-1])
+        y0 = float(CANVAS_HEIGHT - PADDING_BOTTOM)
+        path_str = f"M {0:.1f} {0:.1f} L {max_x - min_x:.1f} {0:.1f}"
+        zero_line_objects.append({
+            'type': 'path',
+            'path': path_str,
+            'left': min_x,
+            'top': y0,
+            'fill': '',
+            'stroke': '#000000',
+            'strokeWidth': 1,
+            'strokeUniform': True,
+            'selectable': False,
+            'evented': False,
+            'hasControls': False,
+            'hasBorders': False,
+            'lockMovementX': True,
+            'lockMovementY': True,
+            'lockScalingX': True,
+            'lockScalingY': True,
+            'lockRotation': True,
+            'hoverCursor': 'default',
+            'name': 'Nullinie',
+        })
+except Exception:
+    pass
 
 # Optionale fixe Labels (nicht verschiebbar)
 label_objects = []
@@ -273,7 +369,7 @@ if ss.labels_on:
             "name": f"label:{name}",
         })
 
-initial_drawing = {"version": "5.2.4", "objects": polygons + label_objects}
+initial_drawing = {"version": "5.2.4", "objects": polygons + consumption_objects + zero_line_objects + label_objects}
 
 # initial_for_canvas:
 reuse_saved_layout = ss.canvas_json is not None and set(ss.selection) == set(ss.prev_selection)
@@ -282,7 +378,6 @@ initial_for_canvas = ss.canvas_json if reuse_saved_layout else initial_drawing
 # ---------------------------
 # Canvas anzeigen
 # ---------------------------
-st.subheader("🖼️ Verschiebbare Flächen")
 canvas = st_canvas(
     fill_color="rgba(0,0,0,0)",
     stroke_width=1,
