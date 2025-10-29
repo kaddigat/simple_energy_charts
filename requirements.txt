@@ -1,5 +1,17 @@
-fastapi
-uvicorn
-streamlit
-plotly
-pandas
+# Core
+streamlit>=1.33
+pandas>=2.2
+numpy>=1.26
+requests>=2.32
+
+# Plot / Viz (klassische App)
+plotly>=5.22
+
+# API (optional)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+
+# Utils
+python-dateutil>=2.9
+typing-extensions>=4.12
