@@ -1,3 +1,5 @@
+Beachte, dass die folgende Readme KI-Erstellt ist.
+
 # Energy Shapes (Canvas) – mit Symbolen
 
 Interaktive Streamlit-Anwendung zum Visualisieren von Stromerzeugung und -verbrauch als **verschiebbare Vektorflächen** – optimiert für Poster, Folien und Infografiken.  
