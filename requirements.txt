@@ -17,4 +17,4 @@ pydantic>=2.8
 python-dateutil>=2.9
 typing-extensions>=4.12
 
-energy-charts @ git+https://github.com/alexanderblinn/Energy-Charts.git@66cb21a
+energy-charts==1.1.0
