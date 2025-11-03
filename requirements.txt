@@ -4,7 +4,6 @@ streamlit-drawable-canvas>=0.9.3
 pandas>=2.2
 numpy>=1.26
 requests>=2.32
-git+https://github.com/alexanderblinn/Energy-Charts.git
 
 # Plot / Viz (klassische App)
 plotly>=5.22
@@ -17,3 +16,5 @@ pydantic>=2.8
 # Utils
 python-dateutil>=2.9
 typing-extensions>=4.12
+
+energy-charts @ git+https://github.com/alexanderblinn/Energy-Charts.git@66cb21a
